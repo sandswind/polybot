@@ -27,16 +27,21 @@ type Market struct {
 type ArbitrageOpportunity struct {
 	PolyMarket   Market  `json:"poly_market"`
 	KalshiMarket Market  `json:"kalshi_market"`
-	MatchScore   float64 `json:"match_score"`    // fuzzy-match confidence [0,100]
+	MatchScore   float64 `json:"match_score"` // fuzzy-match confidence [0,100]
 
 	// Which side is mispriced
-	Side         string  `json:"side"`           // "YES" or "NO"
-	BuyPlatform  string  `json:"buy_platform"`   // buy cheap here
-	SellPlatform string  `json:"sell_platform"`  // sell expensive here
+	Side         string  `json:"side"`          // "YES" or "NO"
+	BuyPlatform  string  `json:"buy_platform"`  // buy cheap here
+	SellPlatform string  `json:"sell_platform"` // sell expensive here
 	BuyPrice     float64 `json:"buy_price"`
 	SellPrice    float64 `json:"sell_price"`
 
 	GrossProfit float64 `json:"gross_profit"` // sell - buy
 	NetProfit   float64 `json:"net_profit"`   // after estimated fees
 	ProfitPct   float64 `json:"profit_pct"`   // net / buy_price
+
+	// Kelly position sizing (populated by the engine when bankroll is known)
+	KellyContracts    float64 `json:"kelly_contracts"`     // recommended contracts to buy
+	KellyBetUSD       float64 `json:"kelly_bet_usd"`       // recommended USD size
+	ExpectedProfitUSD float64 `json:"expected_profit_usd"` // kelly_bet * profit_pct
 }

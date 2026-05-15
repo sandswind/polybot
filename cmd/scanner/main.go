@@ -1,7 +1,7 @@
 // Command scanner is the polybot arbitrage scanner entry point.
 // It polls Polymarket and Kalshi on a configurable interval, fuzzy-matches
-// equivalent markets, calculates cross-platform arbitrage opportunities, and
-// prints a rich terminal report while deduplicating alerts via Redis.
+// equivalent markets, calculates cross-platform arbitrage opportunities with
+// Kelly position sizing, and executes orders via py-clob-client.
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 	"github.com/sandswind/polybot/config"
 	"github.com/sandswind/polybot/internal/cache"
 	"github.com/sandswind/polybot/internal/engine"
+	"github.com/sandswind/polybot/internal/executor"
 	"github.com/sandswind/polybot/internal/fetcher"
 	"github.com/sandswind/polybot/internal/matcher"
 	"github.com/sandswind/polybot/internal/model"
@@ -42,7 +43,28 @@ func main() {
 	engCfg.MinProfitPct = cfg.MinProfitPct
 	engCfg.PolyFeeRate = polyClient.FeeRate()
 	engCfg.KalshiFeeRate = kalshiClient.FeeRate()
+	engCfg.Bankroll = cfg.Bankroll
 	eng := engine.New(engCfg)
+
+	// ── Order executor (optional) ─────────────────────────────────────────────
+	var exec *executor.Executor
+	execCfg := executor.DefaultConfig()
+	execCfg.PythonBin = cfg.PythonBin
+	execCfg.ScriptDir = cfg.ExecutorDir
+	execCfg.DryRun = cfg.DryRun
+
+	if e, err := executor.New(execCfg); err != nil {
+		log.Printf("⚠️   Order executor unavailable (%v) — scan-only mode\n", err)
+	} else if !e.IsAvailable() {
+		log.Println("⚠️   python3 not found — scan-only mode")
+	} else {
+		exec = e
+		mode := "LIVE"
+		if cfg.DryRun {
+			mode = "DRY-RUN"
+		}
+		log.Printf("✅  Order executor ready [%s]\n", mode)
+	}
 
 	// ── Graceful shutdown ────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
@@ -51,15 +73,15 @@ func main() {
 	ticker := time.NewTicker(cfg.ScanInterval)
 	defer ticker.Stop()
 
-	printBanner(cfg)
+	printBanner(cfg, exec != nil)
 
 	// Run first scan immediately, then follow the ticker.
-	runScan(ctx, cfg, polyClient, kalshiClient, eng, redisClient)
+	runScan(ctx, cfg, polyClient, kalshiClient, eng, redisClient, exec)
 
 	for {
 		select {
 		case <-ticker.C:
-			runScan(ctx, cfg, polyClient, kalshiClient, eng, redisClient)
+			runScan(ctx, cfg, polyClient, kalshiClient, eng, redisClient, exec)
 		case <-quit:
 			scans, arbs, _ := redisClient.GetStats(ctx)
 			fmt.Printf("\n👋  Shutting down. Lifetime: %d scans, %d arb opportunities found.\n", scans, arbs)
@@ -68,7 +90,7 @@ func main() {
 	}
 }
 
-// runScan executes one full fetch → match → detect → report cycle.
+// runScan executes one full fetch → match → detect → size → execute cycle.
 func runScan(
 	ctx context.Context,
 	cfg config.Config,
@@ -76,6 +98,7 @@ func runScan(
 	kalshiClient *fetcher.KalshiClient,
 	eng *engine.Engine,
 	redisClient *cache.Client,
+	exec *executor.Executor,
 ) {
 	scanStart := time.Now()
 
@@ -101,7 +124,7 @@ func runScan(
 	// ── 2. Fuzzy-match ───────────────────────────────────────────────────────
 	pairs := matcher.Match(polyMarkets, kalshiMarkets)
 
-	// ── 3. Detect arbitrage ──────────────────────────────────────────────────
+	// ── 3. Detect arbitrage + Kelly sizing ───────────────────────────────────
 	opps := eng.Scan(pairs)
 
 	// ── 4. Update stats ──────────────────────────────────────────────────────
@@ -121,7 +144,7 @@ func runScan(
 		return
 	}
 
-	// ── 6. Report new opportunities ──────────────────────────────────────────
+	// ── 6. Process new opportunities ─────────────────────────────────────────
 	newCount := 0
 	for _, opp := range opps {
 		isNew, err := redisClient.IsNewOpportunity(ctx,
@@ -135,6 +158,11 @@ func runScan(
 		redisClient.IncrArbFound(ctx)
 		newCount++
 		printOpportunity(opp)
+
+		// ── 7. Execute order (buy side only — on Polymarket) ─────────────────
+		if exec != nil && opp.BuyPlatform == string(model.PlatformPolymarket) && opp.KellyContracts > 0 {
+			placeOrder(ctx, exec, opp)
+		}
 	}
 
 	if newCount == 0 {
@@ -142,8 +170,35 @@ func runScan(
 	}
 }
 
-// fetchWithCache returns cached markets when available, otherwise calls fetchFn
-// and stores the result in Redis.
+// placeOrder submits a BUY limit order via the Python executor.
+func placeOrder(ctx context.Context, exec *executor.Executor, opp model.ArbitrageOpportunity) {
+	req := executor.OrderRequest{
+		MarketID: opp.PolyMarket.ID,
+		Side:     "BUY",
+		Outcome:  opp.Side, // "YES" or "NO"
+		Price:    opp.BuyPrice,
+		Size:     opp.KellyContracts,
+	}
+
+	result, err := exec.Execute(ctx, req)
+	if err != nil {
+		fmt.Printf("  │ ⚠️  Executor error: %v\n", err)
+		return
+	}
+
+	if result.DryRun {
+		fmt.Printf("  │ 🧪 DRY-RUN: %s\n", result.Message)
+		return
+	}
+
+	if result.OK {
+		fmt.Printf("  │ ✅ Order placed — ID: %s\n", result.OrderID)
+	} else {
+		fmt.Printf("  │ ❌ Order failed: %s\n", result.Error)
+	}
+}
+
+// fetchWithCache returns cached markets when available, otherwise calls fetchFn.
 func fetchWithCache(
 	ctx context.Context,
 	redisClient *cache.Client,
@@ -157,19 +212,29 @@ func fetchWithCache(
 	if err != nil {
 		return nil, err
 	}
-	_ = redisClient.SetMarkets(ctx, key, markets) // best-effort cache write
+	_ = redisClient.SetMarkets(ctx, key, markets)
 	return markets, nil
 }
 
 // ── Pretty-print helpers ──────────────────────────────────────────────────────
 
-func printBanner(cfg config.Config) {
+func printBanner(cfg config.Config, execReady bool) {
+	execStatus := "✗ scan-only"
+	if execReady {
+		if cfg.DryRun {
+			execStatus = "✓ dry-run"
+		} else {
+			execStatus = "✓ LIVE"
+		}
+	}
 	fmt.Println("╔══════════════════════════════════════════════════════╗")
-	fmt.Println("║          polybot — Arbitrage Scanner MVP             ║")
+	fmt.Println("║          polybot — Arbitrage Scanner                 ║")
 	fmt.Println("╚══════════════════════════════════════════════════════╝")
 	fmt.Printf("  Category    : %s\n", cfg.Category)
 	fmt.Printf("  Scan every  : %s\n", cfg.ScanInterval)
 	fmt.Printf("  Min profit  : %.1f%%\n", cfg.MinProfitPct*100)
+	fmt.Printf("  Bankroll    : $%.2f\n", cfg.Bankroll)
+	fmt.Printf("  Executor    : %s\n", execStatus)
 	fmt.Printf("  Redis       : %s\n", cfg.RedisAddr)
 	fmt.Println()
 }
@@ -181,12 +246,18 @@ func printOpportunity(opp model.ArbitrageOpportunity) {
 	fmt.Printf("  │ Match score : %.0f/100\n", opp.MatchScore)
 	fmt.Printf("  │ Polymarket  : %s\n", truncate(opp.PolyMarket.Question, 60))
 	fmt.Printf("  │ Kalshi      : %s\n", truncate(opp.KalshiMarket.Question, 60))
-	fmt.Printf("  │ Action      : BUY %s @ $%.4f on %-12s\n",
+	fmt.Printf("  │ Action      : BUY  %s @ $%.4f on %-12s\n",
 		opp.Side, opp.BuyPrice, opp.BuyPlatform)
 	fmt.Printf("  │              SELL %s @ $%.4f on %-12s\n",
 		opp.Side, opp.SellPrice, opp.SellPlatform)
 	fmt.Printf("  │ Net/unit    : $%.4f   Gross: $%.4f\n",
 		opp.NetProfit, opp.GrossProfit)
+	if opp.KellyContracts > 0 {
+		fmt.Printf("  │ Kelly size  : %.0f contracts  ($%.2f)  exp. profit: $%.2f\n",
+			opp.KellyContracts, opp.KellyBetUSD, opp.ExpectedProfitUSD)
+	} else {
+		fmt.Println("  │ Kelly size  : — (bankroll not configured or below min)")
+	}
 	fmt.Println("  └─────────────────────────────────────────────────────")
 }
 

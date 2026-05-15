@@ -19,11 +19,17 @@ type Config struct {
 
 	// Scanner behaviour
 	ScanInterval time.Duration
-	FetchLimit   int   // markets to fetch per platform per scan
+	FetchLimit   int     // markets to fetch per platform per scan
 	MinProfitPct float64
 
 	// Category filter sent to each platform API
 	Category string
+
+	// Execution
+	Bankroll      float64 // total capital in USD for Kelly sizing (0 = Kelly disabled)
+	DryRun        bool    // true = log orders, never submit
+	PythonBin     string  // path to python3 binary
+	ExecutorDir   string  // directory containing order_executor.py
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -40,6 +46,11 @@ func Load() Config {
 		MinProfitPct: getEnvFloat("MIN_PROFIT_PCT", 0.02),
 
 		Category: getEnv("MARKET_CATEGORY", "sports"),
+
+		Bankroll:    getEnvFloat("BANKROLL_USD", 0),
+		DryRun:      getEnvBool("DRY_RUN", true),
+		PythonBin:   getEnv("PYTHON_BIN", "python3"),
+		ExecutorDir: getEnv("EXECUTOR_DIR", "executor"),
 	}
 }
 
@@ -63,6 +74,18 @@ func getEnvFloat(key string, fallback float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch v {
+		case "true", "1", "yes":
+			return true
+		case "false", "0", "no":
+			return false
 		}
 	}
 	return fallback

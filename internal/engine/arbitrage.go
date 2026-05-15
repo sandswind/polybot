@@ -2,6 +2,7 @@
 package engine
 
 import (
+	"github.com/sandswind/polybot/internal/kelly"
 	"github.com/sandswind/polybot/internal/matcher"
 	"github.com/sandswind/polybot/internal/model"
 )
@@ -15,6 +16,10 @@ type Config struct {
 	// PolyFeeRate and KalshiFeeRate are the estimated taker fee rates per platform.
 	PolyFeeRate   float64
 	KalshiFeeRate float64
+
+	// Bankroll is the total available capital in USD used for Kelly sizing.
+	// Set to 0 to skip Kelly calculation.
+	Bankroll float64
 }
 
 // DefaultConfig returns conservative defaults.
@@ -23,21 +28,26 @@ func DefaultConfig() Config {
 		MinProfitPct:  0.02,
 		PolyFeeRate:   0.01,
 		KalshiFeeRate: 0.005,
+		Bankroll:      0, // must be set explicitly to enable Kelly sizing
 	}
 }
 
 // Engine detects arbitrage opportunities between matched market pairs.
 type Engine struct {
-	cfg Config
+	cfg    Config
+	sizer  *kelly.Sizer
 }
 
 // New creates a new Engine with the given config.
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg}
+	return &Engine{
+		cfg:   cfg,
+		sizer: kelly.Default(),
+	}
 }
 
 // Scan accepts matched market pairs and returns all opportunities that exceed
-// the configured minimum profit threshold.
+// the configured minimum profit threshold, with Kelly sizing applied.
 //
 // Arbitrage logic (binary YES/NO contracts):
 //
@@ -57,12 +67,14 @@ func (e *Engine) Scan(pairs []matcher.MarketPair) []model.ArbitrageOpportunity {
 			string(model.PlatformKalshi), string(model.PlatformPolymarket),
 		); ok {
 			opp.MatchScore = p.Score
+			e.applyKelly(&opp)
 			opps = append(opps, opp)
 		} else if opp, ok := e.calcOpportunity(p, "YES",
 			p.Poly.YesPrice, p.Kalshi.YesPrice,
 			string(model.PlatformPolymarket), string(model.PlatformKalshi),
 		); ok {
 			opp.MatchScore = p.Score
+			e.applyKelly(&opp)
 			opps = append(opps, opp)
 		}
 
@@ -72,16 +84,30 @@ func (e *Engine) Scan(pairs []matcher.MarketPair) []model.ArbitrageOpportunity {
 			string(model.PlatformKalshi), string(model.PlatformPolymarket),
 		); ok {
 			opp.MatchScore = p.Score
+			e.applyKelly(&opp)
 			opps = append(opps, opp)
 		} else if opp, ok := e.calcOpportunity(p, "NO",
 			p.Poly.NoPrice, p.Kalshi.NoPrice,
 			string(model.PlatformPolymarket), string(model.PlatformKalshi),
 		); ok {
 			opp.MatchScore = p.Score
+			e.applyKelly(&opp)
 			opps = append(opps, opp)
 		}
 	}
 	return opps
+}
+
+// applyKelly fills Kelly sizing fields on an opportunity in-place.
+// No-op when bankroll is not configured.
+func (e *Engine) applyKelly(opp *model.ArbitrageOpportunity) {
+	if e.cfg.Bankroll <= 0 {
+		return
+	}
+	contracts, r := e.sizer.SizeContracts(e.cfg.Bankroll, opp.ProfitPct, opp.BuyPrice)
+	opp.KellyContracts = contracts
+	opp.KellyBetUSD = r.BetSizeUSD
+	opp.ExpectedProfitUSD = r.ExpectedProfitUSD
 }
 
 // calcOpportunity evaluates one directional trade: buy at buyPrice, sell at sellPrice.
