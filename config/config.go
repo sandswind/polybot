@@ -30,6 +30,10 @@ type Config struct {
 	DryRun        bool    // true = log orders, never submit
 	PythonBin     string  // path to python3 binary
 	ExecutorDir   string  // directory containing order_executor.py
+
+	// Lark (Feishu) notifications
+	LarkWebhookURL string // Lark bot webhook URL (empty = disabled)
+	LarkSecret     string // optional HMAC signing secret
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -51,6 +55,9 @@ func Load() Config {
 		DryRun:      getEnvBool("DRY_RUN", true),
 		PythonBin:   getEnv("PYTHON_BIN", "python3"),
 		ExecutorDir: getEnv("EXECUTOR_DIR", "executor"),
+
+		LarkWebhookURL: getEnv("LARK_WEBHOOK_URL", ""),
+		LarkSecret:     getEnv("LARK_SECRET", ""),
 	}
 }
 
