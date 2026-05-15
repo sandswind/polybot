@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: polybot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polybot-scanner
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      KALSHI_API_KEY: "${KALSHI_API_KEY:-}"
+      SCAN_INTERVAL: "${SCAN_INTERVAL:-30s}"
+      FETCH_LIMIT: "${FETCH_LIMIT:-200}"
+      MIN_PROFIT_PCT: "${MIN_PROFIT_PCT:-0.02}"
+      MARKET_CATEGORY: "${MARKET_CATEGORY:-sports}"
+    restart: unless-stopped
+
+volumes:
+  redis_data:
