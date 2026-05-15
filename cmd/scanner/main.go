@@ -21,6 +21,7 @@ import (
 	"github.com/sandswind/polybot/internal/matcher"
 	"github.com/sandswind/polybot/internal/model"
 	"github.com/sandswind/polybot/internal/notify"
+	"github.com/sandswind/polybot/internal/worker"
 )
 
 func main() {
@@ -79,6 +80,14 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	// ── Buyer worker (BLPOP consumer) ─────────────────────────────────────────
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+
+	buyer := worker.NewBuyer(redisClient, exec, lark, cfg.DryRun, "1")
+	go buyer.Run(workerCtx)
+	log.Println("✅  Buyer worker started")
+
 	ticker := time.NewTicker(cfg.ScanInterval)
 	defer ticker.Stop()
 
@@ -92,6 +101,7 @@ func main() {
 		case <-ticker.C:
 			runScan(ctx, cfg, polyClient, kalshiClient, eng, redisClient, exec, lark)
 		case <-quit:
+			cancelWorker() // stop buyer worker
 			scans, arbs, _ := redisClient.GetStats(ctx)
 			fmt.Printf("\n👋  Shutting down. Lifetime: %d scans, %d arb opportunities found.\n", scans, arbs)
 			return
@@ -174,52 +184,31 @@ func runScan(
 			log.Printf("⚠️   Lark notify error: %v\n", err)
 		}
 
-		// ── 7b. Execute order (buy side only — on Polymarket) ──────────────
-		if exec != nil && opp.BuyPlatform == string(model.PlatformPolymarket) && opp.KellyContracts > 0 {
-			placeOrder(ctx, exec, lark, opp)
+		// ── 7b. 推入买入队列 → buyer worker 消费执行 ──────────────────────
+		if opp.BuyPlatform == string(model.PlatformPolymarket) && opp.KellyContracts > 0 {
+			sig := model.BuySignal{
+				MarketID:          opp.PolyMarket.ID,
+				Question:          opp.PolyMarket.Question,
+				Outcome:           opp.Side,
+				Price:             opp.BuyPrice,
+				Size:              opp.KellyContracts,
+				ProfitPct:         opp.ProfitPct,
+				ExpectedProfitUSD: opp.ExpectedProfitUSD,
+				MatchScore:        opp.MatchScore,
+				Source:            "arbitrage-engine",
+				EnqueueAt:         time.Now(),
+			}
+			if err := redisClient.PushBuySignal(ctx, sig); err != nil {
+				log.Printf("⚠️   Enqueue buy signal error: %v\n", err)
+			} else {
+				qlen, _ := redisClient.QueueLength(ctx)
+				fmt.Printf("  │ 📤 Enqueued → queue:buy  (depth: %d)\n", qlen)
+			}
 		}
 	}
 
 	if newCount == 0 {
 		fmt.Printf("   %d opportunity/ies found but all within cooldown window.\n", len(opps))
-	}
-}
-
-// placeOrder submits a BUY limit order via the Python executor and notifies Lark.
-func placeOrder(ctx context.Context, exec *executor.Executor, lark *notify.LarkClient, opp model.ArbitrageOpportunity) {
-	req := executor.OrderRequest{
-		MarketID: opp.PolyMarket.ID,
-		Side:     "BUY",
-		Outcome:  opp.Side,
-		Price:    opp.BuyPrice,
-		Size:     opp.KellyContracts,
-	}
-
-	result, err := exec.Execute(ctx, req)
-	if err != nil {
-		fmt.Printf("  │ ⚠️  Executor error: %v\n", err)
-		if notifyErr := lark.SendOrderResult(ctx, opp, "", err); notifyErr != nil {
-			log.Printf("⚠️   Lark order-result notify error: %v\n", notifyErr)
-		}
-		return
-	}
-
-	if result.DryRun {
-		fmt.Printf("  │ 🧪 DRY-RUN: %s\n", result.Message)
-		return
-	}
-
-	if result.OK {
-		fmt.Printf("  │ ✅ Order placed — ID: %s\n", result.OrderID)
-		if notifyErr := lark.SendOrderResult(ctx, opp, result.OrderID, nil); notifyErr != nil {
-			log.Printf("⚠️   Lark order-result notify error: %v\n", notifyErr)
-		}
-	} else {
-		execErr := fmt.Errorf("%s", result.Error)
-		fmt.Printf("  │ ❌ Order failed: %s\n", result.Error)
-		if notifyErr := lark.SendOrderResult(ctx, opp, "", execErr); notifyErr != nil {
-			log.Printf("⚠️   Lark order-result notify error: %v\n", notifyErr)
-		}
 	}
 }
 
